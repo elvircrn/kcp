@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# mock-kubectl — pretends to be `kubectl exec` against a fake filesystem,
+# and randomly drops connections mid-stream like the real 1006 failures.
+#
+# FAIL_RATE: probability any stream (cat/dd) dies mid-transfer.
+# FAIL_POINT: fraction into the stream where it dies.
+
+set -u
+FS=${MOCK_FS:?MOCK_FS not set}
+FAIL_RATE=${MOCK_FAIL_RATE:-0.3}
+export PATH=${MOCK_ORIG_PATH:?}
+
+POD=
+ARGS=()
+seen_sep=0
+for ((i = 1; i <= $#; i++)); do
+  a=${@:$i:1}
+  if [ "$seen_sep" = 1 ]; then
+    ARGS+=("$a"); continue
+  fi
+  case "$a" in
+    exec) ;;
+    -n|--namespace|-c|--container) i=$((i + 1)) ;;
+    --websockets=false) ;;
+    --) seen_sep=1 ;;
+    -*) ;;
+    *) POD=$a ;;
+  esac
+done
+
+fail_stream() { # bytes_to_emit
+  if awk -v r="$FAIL_RATE" 'BEGIN { srand(); exit !(rand() < r) }'; then
+    kill -PIPE $$ 2>/dev/null; exit 7       # simulate connection dying
+  fi
+}
+
+case "${ARGS[0]-}" in
+  sh)
+    # invocation is: sh -c <script> kcp <arg...>
+    script=${ARGS[2]}
+    # probe
+    if [[ $script == 'p="$1"'* ]]; then
+      p=${ARGS[4]}
+      if [ -d "$FS$p" ]; then echo dir
+      elif [ -f "$FS$p" ]; then printf 'file %s\n' "$(wc -c < "$FS$p" | tr -d ' ')"
+      else echo missing; fi
+      exit 0
+    fi
+    # md5 probe
+    if [ "$script" = 'command -v md5sum >/dev/null && echo y || echo n' ]; then echo y; exit 0; fi
+    # batched tar: cd $1; tar -cf - the remaining argv paths
+    if [[ $script == *'tar -cf -'* ]]; then
+      d=$FS/${ARGS[4]}
+      cd "$d" || exit 9
+      rels=("${ARGS[@]:5}")
+      fail_stream
+      tar -cf - "${rels[@]}"
+      exit 0
+    fi
+    # listing
+    if [[ $script == 'cd "$1"'* ]]; then
+      d=$FS/${ARGS[4]}
+      cd "$d" || exit 9
+      find . -type f | while IFS= read -r f; do
+        printf '%s\t%s\n' "$(wc -c < "$f" | tr -d ' ')" "${f#./}"
+      done
+      exit 0
+    fi
+    echo "mock: unhandled sh script" >&2; exit 1 ;;
+  cat)
+    f=$FS/${ARGS[1]}
+    fail_stream
+    cat "$f" ;;
+  dd)
+    if= count= skip=
+    eval "${ARGS[@]:1}" 2>/dev/null
+    src=$FS/$if
+    bs=$((1024 * 1024))                     # our caller always uses 1M
+    skip_n=$((skip * bs)); count_n=$((count * bs))
+    size=$(wc -c < "$src" | tr -d ' ')
+    emit=$((size - skip_n)); [ "$emit" -gt "$count_n" ] && emit=$count_n
+    [ "$emit" -lt 0 ] && emit=0
+    fail_stream
+    tail -c +"$((skip_n + 1))" "$src" | head -c "$emit" ;;
+  md5sum)
+    md5sum "$FS/${ARGS[1]}" | awk '{print $1}' ;;
+  *) echo "mock: unhandled command: ${ARGS[*]}" >&2; exit 1 ;;
+esac

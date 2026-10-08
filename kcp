@@ -1,0 +1,569 @@
+#!/usr/bin/env bash
+#
+# kcp — resilient, parallel `kubectl cp` replacement for pod → local copies.
+#
+# `kubectl cp` streams one tar over a single exec connection, so large
+# transfers regularly die with:
+#     websocket: close 1006 (abnormal closure): unexpected EOF
+#
+# kcp instead copies each file separately, splits big files into
+# size-verified chunks, retries with exponential backoff + jitter, adapts
+# chunk size to what the connection sustains (grows on success, shrinks on
+# failure), copies several files in parallel, and resumes partial
+# downloads on re-run.
+#
+# Usage:
+#   kcp [options] <pod>[:<remote-path>] <local-dest>
+#
+#   <pod> may be "pod", "pod:/remote/path" or "namespace/pod:/remote/path".
+#   A remote directory is copied to <local-dest>/<basename> (like kubectl cp).
+#
+# Options:
+#   -n <namespace>           kubectl namespace
+#   -c, --container <name>   container to exec in
+#   --parallel <N>           concurrent file transfers (default 8)
+#   --chunk-mb <N>           starting chunk size in MiB (default 64)
+#   --max-chunk-mb <N>       chunk size ceiling in MiB (default 1024)
+#   --min-chunk-mb <N>       chunk size floor in MiB (default 4)
+#   --retries <N>            max consecutive failed attempts per file/op (default 10)
+#   --backoff <secs>         first retry delay; doubles each failure (default 2)
+#   --backoff-cap <secs>     maximum retry delay (default 60)
+#   --verify <mode>          size | md5 | off — verification of copied files (default size)
+#   -h, --help               this help
+#
+# Environment: KCP_PARALLEL, KCP_RETRIES, KCP_CHUNK_MB, KCP_MAX_CHUNK_MB,
+#   KCP_MIN_CHUNK_MB, KCP_BACKOFF_BASE, KCP_BACKOFF_CAP, KCP_VERIFY,
+#   KCP_WEBSOCKETS=1 (keep kubectl's default transport instead of forcing SPDY).
+#
+# Resume: an interrupted large file is left as <dest>.kcp.part; rerun the
+# same command and it continues from where it stopped. Small files are
+# copied via a temp file and renamed, so they are all-or-nothing.
+
+set -o pipefail
+
+MB=1048576
+
+# ---------- config ----------
+NS=""
+POD=""
+CONTAINER=""
+# 8 concurrent exec streams is well within what an API server tolerates
+# while meaningfully overlapping the per-stream latency of flaky links;
+# each worker is one kubectl process. Raise via --parallel/KCP_PARALLEL
+# for many small files; lower to 2-4 if the API server starts throttling.
+PARALLEL=${KCP_PARALLEL:-8}
+MAX_RETRIES=${KCP_RETRIES:-10}
+CHUNK_MB=${KCP_CHUNK_MB:-64}
+MAX_CHUNK_MB=${KCP_MAX_CHUNK_MB:-1024}
+MIN_CHUNK_MB=${KCP_MIN_CHUNK_MB:-4}
+BACKOFF_BASE=${KCP_BACKOFF_BASE:-2}
+BACKOFF_CAP=${KCP_BACKOFF_CAP:-60}
+VERIFY=${KCP_VERIFY:-size}
+
+# ---------- stats ----------
+STAT_DONE=0 STAT_SKIP=0 STAT_FAIL=0 STAT_RETRIES=0
+DONE_BYTES=0 SKIP_BYTES=0
+FAILED=()
+PIDS=()
+
+TTY=1; [ -t 1 ] || TTY=0
+
+info() { printf 'kcp: %s\n' "$*"; }
+warn() { printf 'kcp: warn: %s\n' "$*" >&2; }
+err()  { printf 'kcp: %s\n' "$*" >&2; }
+die()  { err "$@"; exit 1; }
+
+hum() { # bytes -> human readable
+  awk -v b="$1" 'BEGIN {
+    split("B KiB MiB GiB TiB", U, " "); n = 0
+    while (b >= 1024 && n < 4) { b /= 1024; n++ }
+    if (n == 0) printf "%dB", b; else printf "%.1f%s", b, U[n+1]
+  }'
+}
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+local_size() { # path -> byte count (empty if missing)
+  local n; n=$(wc -c < "$1" 2>/dev/null | tr -d '[:space:]'); echo "$n"
+}
+
+on_interrupt() {
+  if [ "${#PIDS[@]}" -gt 0 ]; then kill "${PIDS[@]}" 2>/dev/null; wait 2>/dev/null; fi
+  printf '\n'
+  warn "interrupted — rerun the same command to resume"
+  exit 130
+}
+
+# ---------- argument parsing ----------
+SRC="" DST=""
+need_val() { [ $# -ge 2 ] || die "option $1 needs a value"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n)                 need_val "$@"; NS=$2; shift 2 ;;
+    -c|--container)     need_val "$@"; CONTAINER=$2; shift 2 ;;
+    --parallel)         need_val "$@"; PARALLEL=$2; shift 2 ;;
+    --chunk-mb)         need_val "$@"; CHUNK_MB=$2; shift 2 ;;
+    --max-chunk-mb)     need_val "$@"; MAX_CHUNK_MB=$2; shift 2 ;;
+    --min-chunk-mb)     need_val "$@"; MIN_CHUNK_MB=$2; shift 2 ;;
+    --retries)          need_val "$@"; MAX_RETRIES=$2; shift 2 ;;
+    --backoff)          need_val "$@"; BACKOFF_BASE=$2; shift 2 ;;
+    --backoff-cap)      need_val "$@"; BACKOFF_CAP=$2; shift 2 ;;
+    --verify)           need_val "$@"; VERIFY=$2; shift 2 ;;
+    -h|--help)          usage ;;
+    --)                 shift; break ;;
+    -*)                 die "unknown option: $1 (see --help)" ;;
+    *)  if [ -z "$SRC" ]; then SRC=$1
+        elif [ -z "$DST" ]; then DST=$1
+        else die "unexpected extra argument: $1"; fi
+        shift ;;
+  esac
+done
+
+[ -n "$SRC" ] && [ -n "$DST" ] || die "usage: kcp <pod>[:<remote-path>] <local-dest> (see --help)"
+case "$VERIFY" in size|md5|off) ;; *) die "--verify must be size, md5 or off" ;; esac
+[ "$PARALLEL" -ge 1 ] 2>/dev/null || die "--parallel must be a positive number"
+[ "$CHUNK_MB" -ge 1 ] 2>/dev/null || die "--chunk-mb must be a positive number"
+[ "$MAX_CHUNK_MB" -ge 1 ] 2>/dev/null || die "--max-chunk-mb must be a positive number"
+[ "$MIN_CHUNK_MB" -ge 1 ] 2>/dev/null || die "--min-chunk-mb must be a positive number"
+[ "$MIN_CHUNK_MB" -le "$CHUNK_MB" ] || die "--min-chunk-mb must be <= --chunk-mb"
+[ "$CHUNK_MB" -le "$MAX_CHUNK_MB" ] || die "--chunk-mb must be <= --max-chunk-mb"
+[ "$MAX_RETRIES" -ge 1 ] 2>/dev/null || die "--retries must be a positive number"
+
+# ---------- pod spec ----------
+RPATH=""
+case "$SRC" in
+  *:*) RPATH=${SRC#*:}; HEAD=${SRC%%:*} ;;
+  *)   HEAD=$SRC ;;
+esac
+[ -n "$RPATH" ] || RPATH=.
+while [ "$RPATH" != "/" ] && [ "${RPATH%/}" != "$RPATH" ]; do RPATH=${RPATH%/}; done
+case "$HEAD" in
+  */*) [ -n "$NS" ] || NS=${HEAD%%/*}; POD=${HEAD#*/} ;;
+  *)   POD=$HEAD ;;
+esac
+[ -n "$POD" ] || die "could not parse pod from: $SRC"
+case "$RPATH" in .|/) die "please give an explicit remote path: pod:/path" ;; esac
+
+# ---------- exec template ----------
+# Prefer SPDY over websockets when this kubectl allows it: long-lived
+# websocket streams are what produce `close 1006` in the first place.
+KEXEC=(kubectl exec)
+[ -n "$NS" ] && KEXEC+=(-n "$NS")
+[ -n "$CONTAINER" ] && KEXEC+=(-c "$CONTAINER")
+if [ "${KCP_WEBSOCKETS:-0}" != "1" ] && kubectl exec --help 2>&1 | grep -q -- '--websockets'; then
+  KEXEC+=(--websockets=false)
+fi
+KEXEC+=("$POD" --)
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/kcp.XXXXXX") || die "mktemp failed"
+trap 'rm -rf "$TMP"' EXIT
+trap on_interrupt INT TERM
+
+# ---------- md5 availability ----------
+LMD5=""
+if [ "$VERIFY" = "md5" ]; then
+  if command -v md5sum >/dev/null 2>&1; then LMD5=md5sum
+  elif command -v md5 >/dev/null 2>&1; then LMD5=md5
+  fi
+  RMD5_OK=$("${KEXEC[@]}" sh -c 'command -v md5sum >/dev/null && echo y || echo n' 2>/dev/null)
+  if [ -z "$LMD5" ] || [ "$RMD5_OK" != "y" ]; then
+    warn "md5 not available on both ends; falling back to size-only verification"
+    VERIFY=size
+  fi
+fi
+
+local_md5() {
+  case "$LMD5" in
+    md5sum) md5sum "$1" | awk '{print $1}' ;;
+    md5)    md5 -q "$1" ;;
+  esac
+}
+remote_md5() { "${KEXEC[@]}" md5sum "$1" 2>/dev/null | awk '{print $1}'; }
+
+# ---------- retry plumbing ----------
+sleep_backoff() { # $1 = attempt number (1-based)
+  local d=$(( BACKOFF_BASE * (2 ** ($1 - 1)) ))
+  [ "$d" -gt "$BACKOFF_CAP" ] && d=$BACKOFF_CAP
+  d=$(( d + RANDOM % 3 ))   # jitter
+  warn "retrying in ${d}s"
+  sleep "$d"
+}
+
+with_retry() { # $1 = description, rest = command
+  local desc=$1; shift
+  local n=1 rc=0
+  while :; do
+    "$@" && return 0
+    rc=$?
+    if [ "$n" -ge "$MAX_RETRIES" ]; then
+      err "giving up: $desc (after $n attempts)"
+      return "$rc"
+    fi
+    STAT_RETRIES=$((STAT_RETRIES + 1))
+    warn "$desc failed (attempt $n/$MAX_RETRIES, exit $rc)"
+    sleep_backoff "$n"
+    n=$((n + 1))
+  done
+}
+
+# ---------- remote helpers ----------
+remote_probe() { # -> "dir" | "file <size>" | "missing"
+  "${KEXEC[@]}" sh -c 'p="$1"
+    if [ -d "$p" ]; then echo dir
+    elif [ -f "$p" ]; then printf "file %s\n" "$(wc -c < "$p" | tr -d " ")"
+    else echo missing; fi' kcp "$RPATH" | tr -d '\r'
+}
+
+remote_list() { # $1 = dir -> "size<TAB>relpath" lines
+  "${KEXEC[@]}" sh -c 'cd "$1" || exit 9
+    find . -type f | while IFS= read -r f; do
+      printf "%s\t%s\n" "$(wc -c < "$f" | tr -d " ")" "${f#./}"
+    done' kcp "$1"
+}
+
+# ---------- copy primitives ----------
+copy_small() { # rpath lpath expected_size
+  local tmp="$2.kcp.tmp" errf="$2.kcp.err"
+  if "${KEXEC[@]}" cat "$1" >"$tmp" 2>"$errf"; then
+    if [ "$(local_size "$tmp")" = "$3" ]; then
+      mv -f "$tmp" "$2"
+      rm -f "$errf"; return 0
+    fi
+    err "  short read: got $(local_size "$tmp" 2>/dev/null || echo 0) of $3 bytes"
+  fi
+  tail -3 "$errf" 2>/dev/null >&2
+  rm -f "$tmp" "$errf"
+  return 1
+}
+
+run_chunk() { # rpath mb_off mb_len expected_bytes outfile
+  local errf="$5.err"
+  if "${KEXEC[@]}" dd "if=$1" bs=1M "skip=$2" "count=$3" 2>"$errf" >"$5"; then
+    if [ "$(local_size "$5")" = "$4" ]; then
+      rm -f "$errf"; return 0
+    fi
+    err "  chunk came back short ($(local_size "$5" 2>/dev/null || echo 0) of $4 bytes)"
+  fi
+  grep -Ev 'records|copied' "$errf" 2>/dev/null | tail -3 >&2
+  rm -f "$errf" "$5"
+  return 1
+}
+
+copy_chunked() { # rpath lpath size label
+  local rpath=$1 lpath=$2 size=$3 label=$4
+  local part="$lpath.kcp.part"
+  local copied=0 chunk_mb=$CHUNK_MB consec_fail=0 ok_streak=0
+
+  if [ -f "$part" ]; then
+    copied=$(local_size "$part"); [ -n "$copied" ] || copied=0
+    if [ "$copied" -eq "$size" ]; then
+      mv -f "$part" "$lpath"; return 0
+    elif [ "$copied" -gt "$size" ] || [ $((copied % MB)) -ne 0 ]; then
+      warn "discarding unusable partial file"; : > "$part"; copied=0
+    else
+      info "  resuming partial file at $(hum "$copied") / $(hum "$size")"
+    fi
+  else
+    : > "$part"
+  fi
+
+  while [ "$copied" -lt "$size" ]; do
+    local remaining=$((size - copied))
+    local mb_len=$chunk_mb
+    [ $((mb_len * MB)) -gt "$remaining" ] && mb_len=$(((remaining + MB - 1) / MB))
+    local expected=$((mb_len * MB))
+    [ "$expected" -gt "$remaining" ] && expected=$remaining
+    local mb_off=$((copied / MB))
+
+    if run_chunk "$rpath" "$mb_off" "$mb_len" "$expected" "$lpath.kcp.chunk"; then
+      if ! cat "$lpath.kcp.chunk" >> "$part"; then
+        rm -f "$lpath.kcp.chunk"
+        err "local write failed (disk full?): $lpath"
+        return 1
+      fi
+      rm -f "$lpath.kcp.chunk"
+      copied=$((copied + expected))
+      ok_streak=$((ok_streak + 1)); consec_fail=0
+      if [ "$ok_streak" -ge 4 ] && [ "$chunk_mb" -lt "$MAX_CHUNK_MB" ]; then
+        chunk_mb=$((chunk_mb * 2))
+        [ "$chunk_mb" -gt "$MAX_CHUNK_MB" ] && chunk_mb=$MAX_CHUNK_MB
+        ok_streak=0
+        info "  $label: connection stable — chunk size raised to ${chunk_mb}MiB"
+      fi
+      printf '  %s: %s / %s (%d%%)\n' "$label" "$(hum "$copied")" "$(hum "$size")" $((copied * 100 / size))
+    else
+      consec_fail=$((consec_fail + 1)); ok_streak=0
+      if [ "$consec_fail" -ge "$MAX_RETRIES" ]; then
+        err "giving up on $rpath after $consec_fail consecutive chunk failures; partial kept for resume"
+        return 1
+      fi
+      STAT_RETRIES=$((STAT_RETRIES + 1))
+      if [ "$chunk_mb" -gt "$MIN_CHUNK_MB" ]; then
+        chunk_mb=$((chunk_mb / 2))
+        [ "$chunk_mb" -lt "$MIN_CHUNK_MB" ] && chunk_mb=$MIN_CHUNK_MB
+        warn "  $label: connection struggling — chunk size lowered to ${chunk_mb}MiB"
+      fi
+      sleep_backoff "$consec_fail"
+    fi
+  done
+  mv -f "$part" "$lpath"
+  return 0
+}
+
+verify_file() { # rpath lpath size
+  local got; got=$(local_size "$2")
+  if [ "$got" != "$3" ]; then
+    err "size mismatch: $2 is ${got:-0} bytes, expected $3"
+    return 1
+  fi
+  if [ "$VERIFY" = "md5" ]; then
+    local rl ll
+    rl=$(with_retry "md5sum $1" remote_md5 "$1") || rl=""
+    ll=$(local_md5 "$2")
+    if [ -n "$rl" ] && [ -n "$ll" ]; then
+      if [ "$rl" != "$ll" ]; then
+        err "md5 mismatch on $2 — will recopy on next run"
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+copy_path() { # rpath lpath size label
+  if [ "$3" -le $((CHUNK_MB * MB)) ]; then
+    with_retry "copy $4" copy_small "$1" "$2" "$3"
+  else
+    copy_chunked "$1" "$2" "$3" "$4"
+  fi
+}
+
+# ---------- small-file batching ----------
+# One tar-over-exec for all small files instead of one exec each — this
+# is where most of the per-file latency went.
+BATCH_THRESHOLD_MB=1
+BATCH_LIMIT=200    # files per batch; bounds tar arg lists
+
+batch_small_files() { # $1 = TARGET; batches entries from $TMP/small.list
+  local target=$1
+  local small_list="$TMP/small.list"
+
+  local total
+  total=$(grep -c . "$small_list" || true)
+  [ "$total" -gt 0 ] || return 0
+  info "$total small file(s) — batching"
+
+  local batch="$TMP/batch.files" batch_n=0
+  : > "$batch"
+  while IFS='|' read -r size rel; do
+    printf '%s|%s\n' "$size" "$rel" >> "$batch"
+    batch_n=$((batch_n + 1))
+    if [ "$batch_n" -ge "$BATCH_LIMIT" ]; then
+      run_one_batch "$target" "$batch" "$batch_n"
+      : > "$batch"; batch_n=0
+    fi
+  done < "$small_list"
+  [ "$batch_n" -gt 0 ] && run_one_batch "$target" "$batch" "$batch_n"
+}
+
+run_one_batch() { # target batchfile count — batchfile holds "size|rel" lines
+  local target=$1 batch=$2 count=$3
+  local tarball="$TMP/batch.tar"
+
+  if ! with_retry "tar $count file(s)" tar_remote "$batch" "$tarball"; then
+    warn "batch tar failed — falling back to per-file copy for these $count file(s)"
+    per_file_copy "$target" "$batch"
+    return 0
+  fi
+
+  # extract, then verify each member landed at the right size
+  if tar -xf "$tarball" -C "$target" 2>/dev/null; then
+    local ok=1 size rel
+    while IFS='|' read -r size rel; do
+      if [ "$(local_size "$target/$rel")" != "$size" ]; then
+        ok=0; warn "batched file bad after extract: $rel"
+      fi
+    done < "$batch"
+    if [ "$ok" = 1 ]; then
+      while IFS='|' read -r size rel; do
+        echo "DONE $size" >> "$RES_FILE"
+      done < "$batch"
+      return 0
+    fi
+    warn "verification failed for a batched file — falling back to per-file copy"
+  fi
+  per_file_copy "$target" "$batch"
+}
+
+per_file_copy() { # target batchfile — copies members one by one, records results
+  local target=$1 batch=$2 size rel
+  while IFS='|' read -r size rel; do
+    mkdir -p "$(dirname "$target/$rel")"
+    copy_path "$RPATH/$rel" "$target/$rel" "$size" "$rel" \
+      && verify_file "$RPATH/$rel" "$target/$rel" "$size" \
+      && { echo "DONE $size" >> "$RES_FILE"; continue; }
+    echo "FAIL $rel" >> "$RES_FILE"
+  done < "$batch"
+}
+
+tar_remote() { # batchfile(size|rel lines) -> tarball : one exec, tar of members
+  local batchfile=$1 tarball=$2
+  # rel paths are passed as argv to the remote script (a local file can't
+  # be read pod-side); argv length is bounded by BATCH_LIMIT
+  local rels=()
+  while IFS='|' read -r _ rel; do rels+=("$rel"); done < "$batchfile"
+  # shellcheck disable=SC2016,SC2068
+  if "${KEXEC[@]}" sh -c 'cd "$1" || exit 9; shift
+    eval "tar -cf - $(printf "\"%s\" " "$@")"' kcp "$RPATH" ${rels[@]+"${rels[@]}"} > "$tarball" 2>"$tarball.err"; then
+    return 0
+  fi
+  tail -3 "$tarball.err" 2>/dev/null >&2
+  return 1
+}
+
+process_entry() { # idx size rel
+  local idx=$1 size=$2 rel=$3
+  local rpath="$RPATH/$rel" lpath="$TARGET/$rel"
+  printf 'kcp: [%d/%d] %s (%s)\n' "$idx" "$TOTAL_N" "$rel" "$(hum "$size")"
+
+  if [ -f "$lpath" ] && [ "$(local_size "$lpath")" = "$size" ]; then
+    if [ "$VERIFY" != "md5" ] || verify_file "$rpath" "$lpath" "$size"; then
+      info "  already present — skipping"
+      echo "SKIP $size" >> "$RES_FILE"
+      return 0
+    fi
+    warn "  exists but failed verification — recopying"
+  fi
+
+  mkdir -p "$(dirname "$lpath")"
+  if copy_path "$rpath" "$lpath" "$size" "$rel" && verify_file "$rpath" "$lpath" "$size"; then
+    echo "DONE $size" >> "$RES_FILE"
+  else
+    echo "FAIL $rel" >> "$RES_FILE"
+  fi
+}
+
+worker() { # $1 = worker id; reads its bucket, writes $TMP/res.<id>
+  local w=$1 res="$TMP/res.$w"
+  local idx size rel rest
+  RES_FILE=$res
+  while IFS=$'\t' read -r idx size rel rest; do
+    [ -n "$idx" ] || continue
+    if [ -n "${rest:-}" ]; then
+      warn "skipping file with odd name: $rel$rest"
+      continue
+    fi
+    process_entry "$idx" "$size" "$rel"
+  done < "$TMP/bucket.$w"
+  echo "RETRIES $STAT_RETRIES" >> "$res"
+}
+
+aggregate_results() { # merge worker result files into STAT_*
+  local f op val rest
+  for f in "$TMP"/res.*; do
+    [ -f "$f" ] || continue
+    while IFS=' ' read -r op val rest; do
+      case "$op" in
+        DONE)    STAT_DONE=$((STAT_DONE + 1)); DONE_BYTES=$((DONE_BYTES + val)) ;;
+        SKIP)    STAT_SKIP=$((STAT_SKIP + 1)); SKIP_BYTES=$((SKIP_BYTES + val)) ;;
+        FAIL)    STAT_FAIL=$((STAT_FAIL + 1)); FAILED+=("$val${rest:+ $rest}") ;;
+        RETRIES) STAT_RETRIES=$((STAT_RETRIES + val)) ;;
+      esac
+    done < "$f"
+  done
+}
+
+# ---------- main ----------
+PROBE=$(with_retry "probe $POD:$RPATH" remote_probe) || die "could not reach pod $POD (running? context?)"
+
+case "$PROBE" in
+  dir)
+    BASE=$(basename "$RPATH")
+    if [ -d "$DST" ]; then TARGET="$DST/$BASE"; else TARGET=$DST; fi
+    mkdir -p "$TARGET" || die "cannot create $TARGET"
+    info "pod $POD:$RPATH -> $TARGET"
+
+    LISTING="$TMP/listing"
+    with_retry "list $RPATH" remote_list "$RPATH" > "$LISTING" || die "could not list $RPATH"
+
+    awk -F'\t' -v target="$TARGET" '
+      { lpath = target "/" $2
+        cmd = "wc -c 2>/dev/null < \"" lpath "\""
+        cmd | getline got; close(cmd)
+        gsub(/ /, "", got)
+        if (got != $1) printf "%s|%s\n", $1, $2
+      }' "$LISTING" > "$TMP/all.list"
+    # small files go through one tar-over-exec batch; the rest go to workers
+    awk -F'|' -v lim=$((BATCH_THRESHOLD_MB * MB)) '$1 <= lim' "$TMP/all.list" > "$TMP/small.list"
+    awk -F'|' -v lim=$((BATCH_THRESHOLD_MB * MB)) '$1 >  lim' "$TMP/all.list" > "$TMP/large.list"
+
+    # largest first: long transfers start immediately, small files fill gaps
+    sort -t'|' -k1,1rn "$TMP/large.list" -o "$TMP/large.list"
+
+    TOTAL_N=$(grep -c . "$TMP/all.list" || true)
+    NPROC=$PARALLEL
+    [ "$NPROC" -gt "$TOTAL_N" ] && NPROC=$TOTAL_N
+    [ "$NPROC" -lt 1 ] && NPROC=1
+    info "$TOTAL_N file(s) to copy, $NPROC worker(s)"
+
+    # batched small files first — they land in one exec, not N
+    if [ -s "$TMP/small.list" ]; then
+      RES_FILE="$TMP/res.batch"
+      batch_small_files "$TARGET"
+    fi
+
+    # round-robin the descending-size list into per-worker buckets
+    i=0
+    while IFS='|' read -r fsize frel; do
+      [ -n "$fsize" ] || continue
+      i=$((i + 1))
+      printf '%s\t%s\t%s\n' "$i" "$fsize" "$frel" >> "$TMP/bucket.$(( (i - 1) % NPROC ))"
+    done < "$TMP/large.list"
+
+    w=0
+    while [ "$w" -lt "$NPROC" ]; do
+      [ -f "$TMP/bucket.$w" ] || : > "$TMP/bucket.$w"
+      worker "$w" &
+      PIDS+=($!)
+      w=$((w + 1))
+    done
+    wait
+    aggregate_results
+    ;;
+
+  file\ *)
+    size=${PROBE#file }
+    if [ -d "$DST" ]; then LPATH="$DST/$(basename "$RPATH")"; else LPATH=$DST; fi
+    mkdir -p "$(dirname "$LPATH")" || die "cannot create $(dirname "$LPATH")"
+    info "pod $POD:$RPATH -> $LPATH ($(hum "$size"))"
+
+    if [ -f "$LPATH" ] && [ "$(local_size "$LPATH")" = "$size" ]; then
+      if [ "$VERIFY" != "md5" ] || verify_file "$RPATH" "$LPATH" "$size"; then
+        info "already present — nothing to do"
+        STAT_SKIP=1; SKIP_BYTES=$size
+        summary_and_exit
+      fi
+    fi
+
+    if copy_path "$RPATH" "$LPATH" "$size" "$(basename "$RPATH")" && verify_file "$RPATH" "$LPATH" "$size"; then
+      STAT_DONE=1; DONE_BYTES=$size
+    else
+      STAT_FAIL=1; FAILED+=("$RPATH")
+    fi
+    ;;
+
+  missing) die "remote path not found: $RPATH" ;;
+  *)       die "unexpected probe reply: $PROBE" ;;
+esac
+
+summary_and_exit() {
+  info "summary: $STAT_DONE copied ($(hum "$DONE_BYTES")), $STAT_SKIP skipped ($(hum "$SKIP_BYTES")), $STAT_FAIL failed, $STAT_RETRIES retries, ${SECONDS}s"
+  if [ "$STAT_FAIL" -gt 0 ]; then
+    err "failed files (rerun to retry):"
+    for f in ${FAILED[@]+"${FAILED[@]}"}; do err "  $f"; done
+    exit 1
+  fi
+  exit 0
+}
+summary_and_exit

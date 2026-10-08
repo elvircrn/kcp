@@ -1,0 +1,6 @@
+kcp-go/kcp
+kcp-go/kcp-*
+*.kcp.part
+*.kcp.chunk
+*.kcp.tmp
+.DS_Store
