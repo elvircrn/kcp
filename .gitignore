@@ -4,3 +4,4 @@ kcp-go/kcp-*
 *.kcp.chunk
 *.kcp.tmp
 .DS_Store
+kcp-go/dist/
